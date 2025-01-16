@@ -1,10 +1,12 @@
 import json
+import os.path
 import time
 import logging
 from collections import deque
 
 # Django
 from django.conf import settings
+from django.contrib.messages.api import error
 from django_guid import get_guid
 from django.utils.functional import cached_property
 from django.db import connections
@@ -15,11 +17,39 @@ from awx.main.constants import MINIMAL_EVENTS, ANSIBLE_RUNNER_NEEDS_UPDATE_MESSA
 from awx.main.utils.update_model import update_model
 from awx.main.queue import CallbackQueueDispatcher
 
+from flags.state import flag_enabled
+
 logger = logging.getLogger('awx.main.tasks.callback')
+
+
+def try_load_query_file(artifact_dir) -> (bool, dict):
+    if not flag_enabled("FEATURE_INDIRECT_NODE_COUNTING_ENABLED"):
+        return False, None
+
+    queries_path = os.path.join(artifact_dir, "ansible_data.json")
+    if not os.path.isfile(queries_path):
+        logger.info(f"no query file found: {queries_path}")
+        return False, None
+
+    try:
+        f = open(queries_path, "r")
+    except OSError as e:
+        logger.error(f"error opening query file {queries_path}: {e}")
+        return False, None
+
+    with f:
+        try:
+            queries = json.load(f)
+        except ValueError as e:
+            logger.error(f"error parsing query file {queries_path}: {e}")
+            return False, None
+
+        return True, queries
 
 
 class RunnerCallback:
     def __init__(self, model=None):
+        self.instance = None
         self.parent_workflow_job_id = None
         self.host_map = {}
         self.guid = get_guid()
@@ -214,6 +244,10 @@ class RunnerCallback:
                     self.delay_update(**{field_name: field_value})
 
     def artifacts_handler(self, artifact_dir):
+        success, query_file_contents = try_load_query_file(artifact_dir)
+        if success:
+            self.instance = self.update_model(self.instance.pk, job_queries=query_file_contents)
+
         self.artifacts_processed = True
 
 
